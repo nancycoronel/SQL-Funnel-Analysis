@@ -1,0 +1,89 @@
+WITH cohort AS (
+SELECT    user_id
+FROM    ecomm_roi
+WHERE    event = 'Visit'
+GROUP BY    user_id
+HAVING    MIN(timestamp) BETWEEN '2024-02-01' AND '2024-03-31'
+), -- all users from the CTE where we have our first time visited customers BETWEEN '2024-02-01' AND '2024-03-31' and their first timestamp in each event between those dates.
+SELECT     c.user_id,
+           e.device,	
+           e.event,
+           MIN(timestamp) AS min_timestamp,
+           MIN(e.price_x) AS price
+FROM    cohort c
+JOIN    ecomm_roi e  ON  c.user_id = e.user_id
+WHERE    e.event IN ('visit','view_product','add_to_cart','checkout','purchase') AND 
+         timestamp BETWEEN '2024-02-01' AND '2024-03-31'
+GROUP BY    c.user_id, e.device, e.event
+), -- for each user and device i keep the first time they reached each funnel step during the cohort window.
+user_step_times AS (
+SELECT    user_id,
+          device,
+          event AS step,
+          min_timestamp,
+          LAG(min_timestamp) OVER (PARTITION BY user_id, device ORDER BY CASE event WHEN 'visit' THEN 1 WHEN 'view_product' THEN 2 WHEN 'add_to_cart' THEN 3 WHEN 'checkout' THEN 4 WHEN 'purchase' THEN 5 END) AS previous_timestamp,
+          CASE 
+              WHEN LAG(min_timestamp) OVER (PARTITION BY user_id, device ORDER BY CASE event WHEN 'visit' THEN 1 WHEN 'view_product' THEN 2 WHEN 'add_to_cart' THEN 3 WHEN 'checkout' THEN 4 WHEN 'purchase' THEN 5 END) IS NULL THEN NULL 
+              WHEN DATEDIFF(MINUTE, LAG(min_timestamp) OVER (PARTITION BY user_id, device ORDER BY CASE event WHEN 'visit' THEN 1 WHEN 'view_product' THEN 2 WHEN 'add_to_cart' THEN 3 WHEN 'checkout' THEN 4 WHEN 'purchase' THEN 5 END), min_timestamp) < 0 THEN NULL 
+              ELSE DATEDIFF(MINUTE, LAG(min_timestamp) OVER (PARTITION BY user_id, device ORDER BY CASE event WHEN 'visit' THEN 1 WHEN 'view_product' THEN 2 WHEN 'add_to_cart' THEN 3 WHEN 'checkout' THEN 4 WHEN 'purchase' THEN 5 END), min_timestamp)
+          END AS minutes_in_step
+FROM    user_event
+), -- i calculate how many minutes users spend at each step before moving to the next one.
+median_step_time AS (
+SELECT    DISTINCT 
+          device, 
+          step,
+          PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY minutes_in_step) OVER (PARTITION BY device, step) AS median_minutes
+FROM    user_step_times
+WHERE    minutes_in_step IS NOT NULL 
+), -- for each user and device show me what steps have happened.
+funnel_users AS (
+SELECT    user_id,
+          device,
+          MAX(CASE WHEN event = 'visit' THEN 1 ELSE 0 END) AS visit,
+          MAX(CASE WHEN event = 'view_product' THEN 1 ELSE 0 END) AS view_product,
+          MAX(CASE WHEN event = 'add_to_cart' THEN 1 ELSE 0 END) AS add_to_cart,
+          MAX(CASE WHEN event = 'checkout' THEN 1 ELSE 0 END) AS checkout,
+          MAX(CASE WHEN event = 'purchase' THEN 1 ELSE 0 END) AS purchase,
+          MAX(CASE WHEN event = 'purchase' THEN price END) AS purchase_price
+FROM    user_event
+GROUP BY    user_id, device
+), -- pivote table: for each user and device, i mark which funnel steps they reached and capture their purchase value if they converted.
+funnel_counts AS (
+SELECT	device, 'visit' AS step, COUNT(*) AS cnt, 1 AS step_order FROM funnel_users GROUP BY device
+UNION ALL 
+SELECT	device, 'view_product', COUNT(*), 2 FROM funnel_users WHERE visit = 1 AND view_product = 1 GROUP BY device
+UNION ALL
+SELECT	device, 'add_to_cart', COUNT(*), 3 FROM funnel_users WHERE view_product = 1 AND add_to_cart = 1 GROUP BY device
+UNION ALL
+SELECT	device, 'checkout', COUNT(*), 4 FROM funnel_users WHERE add_to_cart = 1 AND checkout = 1 GROUP BY device
+UNION ALL
+SELECT	device, 'purchase', COUNT(*), 5 FROM funnel_users WHERE checkout = 1 AND purchase = 1 GROUP BY device
+), -- show avg for each device where purchase did happen  This shows how many users make it to each funnel step on each device.
+median_purchase_per_device AS (
+SELECT    device,
+          MIN(median_price) AS median_price
+FROM    (SELECT    device,
+                   purchase_price,
+                   PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY purchase_price) OVER (PARTITION BY device) AS median_price
+         FROM    funnel_users
+         WHERE    purchase = 1
+        ) t
+GROUP BY    device
+) -- this represents the typical purchase value for users who convert on each device.
+SELECT    f.device,
+          f.step,
+          f.cnt AS count,
+          CAST(f.cnt * 1.0 / LAG(f.cnt) OVER (PARTITION BY f.device ORDER BY f.step_order) AS decimal (6,3)) AS conversion_rate,
+          100.0 - CAST(f.cnt * 100.0 / LAG(f.cnt) OVER (PARTITION BY f.device ORDER BY f.step_order) AS decimal (6,2)) AS drop_off,
+          mid.median_price, --should i do avgprice or median?? 
+          m.median_minutes AS median_minutes_in_step,
+	        CASE	
+              WHEN LAG(f.cnt) OVER (PARTITION BY f.device ORDER BY f.step_order) IS NOT NULL
+              THEN (LAG(f.cnt) OVER (PARTITION BY f.device ORDER BY f.step_order) - f.cnt) * mid.median_price
+          END AS potential_revenue_loss
+FROM    funnel_counts f
+JOIN    median_purchase_per_device mid ON f.device = mid.device
+LEFT JOIN    median_step_time m ON f.device = m.device AND f.step = m.step
+ORDER BY    f.device, 
+            f.step_order; -- this final output shows where users drop off, how long they get stuck, and how much revenue we potentially lost at each step -broken down by device.
